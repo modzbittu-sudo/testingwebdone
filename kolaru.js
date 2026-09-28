@@ -59,9 +59,9 @@ if (tokens.length === 0) {
 }
 
 // --- SINGLE GLOBAL AUDIO PLAYER (perfect sync for all bots) ---
-let globalVolume = 6.0;
-let globalDistortion = 12;
-let globalMute = true;
+let globalVolume = 24.0;
+let globalDistortion = 26;
+let globalMute = false;
 let globalDeaf = false;
 let globalAudioProcess = null;
 
@@ -95,8 +95,9 @@ function playGlobalAudio() {
     try { globalAudioProcess.kill(); } catch(e) {}
   }
 
-  const distortionLevel = Math.max(1, Number(globalDistortion) || 12);
-  const filterChain = `volume=${globalVolume},highpass=f=80,lowpass=f=18000,acrusher=level_in=${distortionLevel}:level_out=18:bits=8:mode=log:mix=1,volume=${globalVolume}`;
+  const distortionLevel = Math.max(1, Number(globalDistortion) || 26);
+  const boostedVolume = Math.max(2.0, globalVolume * 1.8);
+  const filterChain = `volume=${boostedVolume},highpass=f=30,lowpass=f=20000,eq=band=120:gain=6:width_type=h:bandwidth=80,acrusher=level_in=${distortionLevel}:level_out=12:bits=2:mode=log:mix=1,volume=${boostedVolume}`;
 
   globalAudioProcess = spawn(ffmpeg, [
     '-i', './shared_audio.mp3',
@@ -468,15 +469,15 @@ const server = http.createServer(async (req, res) => {
     </div>
     <div style="margin-bottom: 16px;">
       <label style="display:flex; justify-content:space-between; margin-bottom:8px; font-weight:bold; color:#f43f5e;">
-        Volume Multiplier: <span id="volDisplay">6.0x</span>
+        Volume Multiplier: <span id="volDisplay">24.0x</span>
       </label>
-      <input type="range" id="volSlider" min="0" max="20" step="0.1" value="6" style="width:100%; accent-color:#f43f5e; cursor:pointer;" />
+      <input type="range" id="volSlider" min="0" max="50" step="0.1" value="24" style="width:100%; accent-color:#f43f5e; cursor:pointer;" />
     </div>
     <div style="margin-bottom: 16px;">
       <label style="display:flex; justify-content:space-between; margin-bottom:8px; font-weight:bold; color:#f97316;">
-        Distortion: <span id="distortionDisplay">12.0</span>
+        Distortion: <span id="distortionDisplay">26.0</span>
       </label>
-      <input type="range" id="distortionSlider" min="1" max="30" step="0.5" value="12" style="width:100%; accent-color:#f97316; cursor:pointer;" />
+      <input type="range" id="distortionSlider" min="1" max="40" step="0.5" value="26" style="width:100%; accent-color:#f97316; cursor:pointer;" />
     </div>
     <div class="actions">
       <button id="uploadPlayBtn" style="background:#8b5cf6;color:#fff;">Upload & Play to All</button>
@@ -548,14 +549,14 @@ const server = http.createServer(async (req, res) => {
           }
           return c;
         }
-        dist.curve = curve(6);
-        dist.oversample = '4x';
+        dist.curve = curve(18);
+        dist.oversample = '8x';
 
         const sat = ctx.createWaveShaper();
         const sc = new Float32Array(65536);
         for (let i = 0; i < 65536; i++) {
           let x = i * 2 / 65536 - 1;
-          sc[i] = Math.tanh(x * 8);
+          sc[i] = Math.tanh(x * 18);
         }
         sat.curve = sc;
 
@@ -581,9 +582,9 @@ const server = http.createServer(async (req, res) => {
         const e2W = ctx.createGain(); e2W.gain.value = 0.16;
 
         const sub = ctx.createOscillator(); sub.type = 'sine'; sub.frequency.value = 42;
-        const subG = ctx.createGain(); subG.gain.value = 0.16;
+        const subG = ctx.createGain(); subG.gain.value = 0.42;
 
-        const m = ctx.createGain(); m.gain.value = 240;
+        const m = ctx.createGain(); m.gain.value = 420;
 
         const limit = ctx.createWaveShaper();
         const lc = new Float32Array(65536);
