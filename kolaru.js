@@ -40,6 +40,83 @@ function parseJSONBody(req) {
   });
 }
 
+async function parseRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    req.on('end', () => {
+      try {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        if (!raw) {
+          resolve({});
+          return;
+        }
+
+        const contentType = (req.headers['content-type'] || '').toLowerCase();
+        if (contentType.includes('application/json')) {
+          resolve(JSON.parse(raw || '{}'));
+          return;
+        }
+
+        if (contentType.includes('application/x-www-form-urlencoded')) {
+          const params = new URLSearchParams(raw);
+          const parsed = {};
+          for (const [key, value] of params.entries()) parsed[key] = value;
+          resolve(parsed);
+          return;
+        }
+
+        if (contentType.includes('multipart/form-data')) {
+          const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+          const boundary = boundaryMatch ? (boundaryMatch[1] || boundaryMatch[2]) : null;
+          if (!boundary) {
+            resolve({});
+            return;
+          }
+
+          const parsed = {};
+          const segments = raw.split(`--${boundary}`);
+          for (const segment of segments) {
+            const block = segment.trim();
+            if (!block || block === '--') continue;
+            const headerEnd = block.indexOf('\r\n\r\n');
+            if (headerEnd < 0) continue;
+            const headers = block.slice(0, headerEnd);
+            const content = block.slice(headerEnd + 4).replace(/\r\n--$/, '').replace(/--$/, '').trim();
+            const dispositionMatch = headers.match(/content-disposition:\s*form-data;\s*name="([^"]+)"(?:;\s*filename="([^"]*)")?/i);
+            if (!dispositionMatch) continue;
+            const name = dispositionMatch[1];
+            const filename = dispositionMatch[2] || '';
+            if (!filename) {
+              parsed[name] = content;
+            } else {
+              parsed.file = content;
+              parsed.fileName = filename;
+            }
+          }
+
+          const tokenText = String(parsed.tokens || parsed.file || parsed.text || parsed.contents || '');
+          const maxBotsValue = Number(parsed.maxBots || parsed.maxbots || '');
+          resolve({ tokens: tokenText, maxBots: Number.isFinite(maxBotsValue) && maxBotsValue > 0 ? Math.floor(maxBotsValue) : Number.MAX_SAFE_INTEGER });
+          return;
+        }
+
+        try {
+          resolve(JSON.parse(raw || '{}'));
+        } catch (error) {
+          const params = new URLSearchParams(raw);
+          const parsed = {};
+          for (const [key, value] of params.entries()) parsed[key] = value;
+          resolve(parsed);
+        }
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
 const rawTokens = process.env.BOT_TOKENS || process.env.BOT_TOKEN || '';
 let tokens = parseTokenList(rawTokens);
 const autoJoin = (process.env.AUTO_JOIN || 'false').toLowerCase() === 'true';
@@ -490,6 +567,13 @@ const server = http.createServer(async (req, res) => {
       <button id="deafAllBtn" style="background:#4b5563;color:#fff;">Deafen All</button>
       <button id="undeafAllBtn" style="background:#3b82f6;color:#fff;">Undeafen All</button>
     </div>
+    <div class="actions" style="margin-top:16px;">
+      <button type="button" class="preset-btn" data-preset="soft" style="background:#34d399;color:#06281f;">Soft</button>
+      <button type="button" class="preset-btn" data-preset="normal" style="background:#38bdf8;color:#082f49;">Normal</button>
+      <button type="button" class="preset-btn" data-preset="hard" style="background:#f59e0b;color:#451a03;">Hard</button>
+      <button type="button" class="preset-btn" data-preset="ultra" style="background:#f43f5e;color:#4c0519;">Ultra</button>
+      <button type="button" class="preset-btn" data-preset="insane" style="background:#a855f7;color:#2e1065;">Insane</button>
+    </div>
     <div id="audioMessage" style="margin:18px 0 0;color:#cbd5e1;"></div>
   </div>
 
@@ -650,6 +734,13 @@ const server = http.createServer(async (req, res) => {
     const volDisplay = document.getElementById('volDisplay');
     const distortionSlider = document.getElementById('distortionSlider');
     const distortionDisplay = document.getElementById('distortionDisplay');
+    const AUDIO_PRESETS = {
+      soft: { volume: 4, distortion: 8 },
+      normal: { volume: 9, distortion: 15 },
+      hard: { volume: 16, distortion: 22 },
+      ultra: { volume: 24, distortion: 30 },
+      insane: { volume: 38, distortion: 40 }
+    };
 
     const renderTokenList = (data) => {
       if (!data || !Array.isArray(data.tokens)) {
@@ -786,9 +877,9 @@ const server = http.createServer(async (req, res) => {
       try {
         const text = await file.text();
         const tokensFromFile = (text || '')
-          .split(/\r?\n|,/)
-          .map((item) => item.replace(/^#.*$/, '').trim())
-          .filter(Boolean);
+          .split(/\r?\n|,|\s+/)
+          .map((item) => item.replace(/^#.*$/, '').replace(/['"\[\]]/g, '').trim())
+          .filter((item) => item && item.length > 16 && !/^discord$/i.test(item));
 
         if (tokensFromFile.length === 0) {
           tokenMessageEl.textContent = 'No valid tokens found in the txt file.';
@@ -797,7 +888,7 @@ const server = http.createServer(async (req, res) => {
 
         const maxBots = Number(maxBotsInput.value);
         const payload = {
-          tokens: tokensFromFile,
+          tokens: tokensFromFile.join('\n'),
           maxBots: Number.isFinite(maxBots) && maxBots > 0 ? Math.floor(maxBots) : Number.MAX_SAFE_INTEGER,
         };
 
@@ -876,8 +967,25 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {}
     };
 
+    const applyAudioPreset = async (presetName) => {
+      const preset = AUDIO_PRESETS[presetName] || AUDIO_PRESETS.ultra;
+      volSlider.value = preset.volume;
+      distortionSlider.value = preset.distortion;
+      volDisplay.textContent = Number(preset.volume).toFixed(1) + 'x';
+      distortionDisplay.textContent = Number(preset.distortion).toFixed(1);
+      await syncAudioSettings();
+      audioMessage.textContent = 'Preset loaded: ' + presetName;
+    };
+
+    document.querySelectorAll('.preset-btn').forEach((button) => {
+      button.addEventListener('click', async () => {
+        await applyAudioPreset(button.dataset.preset || 'ultra');
+      });
+    });
+
     volSlider.addEventListener('change', syncAudioSettings);
     distortionSlider.addEventListener('change', syncAudioSettings);
+    applyAudioPreset('ultra');
 
     document.getElementById('uploadPlayBtn').addEventListener('click', async () => {
       if (!audioFile.files[0]) {
@@ -1018,8 +1126,9 @@ const server = http.createServer(async (req, res) => {
 
   if (req.url === '/tokens/import' && req.method === 'POST') {
     try {
-      const body = await parseJSONBody(req);
-      const importedTokens = parseTokenList(Array.isArray(body.tokens) ? body.tokens : [body.tokens || body.text || body.contents || body.file || '']);
+      const body = await parseRequestBody(req);
+      const importPayload = Array.isArray(body.tokens) ? body.tokens : String(body.tokens || body.text || body.contents || body.file || '');
+      const importedTokens = parseTokenList(importPayload);
       const maxBotLimit = Number(body.maxBots);
       const maxBotsAllowed = Number.isFinite(maxBotLimit) && maxBotLimit > 0 ? Math.floor(maxBotLimit) : Number.MAX_SAFE_INTEGER;
 
