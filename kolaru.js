@@ -8,7 +8,7 @@ const ffmpeg = require('ffmpeg-static');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { parseTokenList, addTokenToList, persistTokenList } = require('./token-store');
+const { parseTokenList, readTokenFile, addTokenToList, persistTokenList } = require('./token-store');
 
 function parseList(value) {
   return (value || '')
@@ -59,7 +59,8 @@ if (tokens.length === 0) {
 }
 
 // --- SINGLE GLOBAL AUDIO PLAYER (perfect sync for all bots) ---
-let globalVolume = 2.0;
+let globalVolume = 6.0;
+let globalDistortion = 12;
 let globalMute = true;
 let globalDeaf = false;
 let globalAudioProcess = null;
@@ -94,9 +95,12 @@ function playGlobalAudio() {
     try { globalAudioProcess.kill(); } catch(e) {}
   }
 
+  const distortionLevel = Math.max(1, Number(globalDistortion) || 12);
+  const filterChain = `volume=${globalVolume},highpass=f=80,lowpass=f=18000,acrusher=level_in=${distortionLevel}:level_out=18:bits=8:mode=log:mix=1,volume=${globalVolume}`;
+
   globalAudioProcess = spawn(ffmpeg, [
     '-i', './shared_audio.mp3',
-    '-af', `volume=${globalVolume}`,
+    '-af', filterChain,
     '-f', 's16le',
     '-ar', '48000',
     '-ac', '2',
@@ -329,13 +333,15 @@ async function loginBot(bot, index) {
   }
 }
 
-async function addTokenAndLogin(newToken) {
+async function addTokenAndLogin(newToken, maxBotsOverride) {
   const token = String(newToken || '').trim();
   if (!token) {
     throw new Error('Token is required.');
   }
 
-  const updatedTokens = addTokenToList(tokens, token, Number.MAX_SAFE_INTEGER);
+  const rawMaxBots = Number(maxBotsOverride);
+  const maxBotsAllowed = Number.isFinite(rawMaxBots) && rawMaxBots > 0 ? Math.floor(rawMaxBots) : Number.MAX_SAFE_INTEGER;
+  const updatedTokens = addTokenToList(tokens, token, maxBotsAllowed);
   const isDuplicate = tokens.includes(token);
   const isAtCapacity = updatedTokens.length === tokens.length && !updatedTokens.includes(token);
 
@@ -426,10 +432,15 @@ const server = http.createServer(async (req, res) => {
     <h2 style="margin-top:0;">Token Manager</h2>
     <div class="form-row">
       <input id="tokenInput" placeholder="Paste Discord bot token" />
+      <input id="maxBotsInput" type="number" min="1" placeholder="Max bots (blank = all tokens)" />
     </div>
     <div class="actions">
       <button id="addTokenBtn" style="background:#8b5cf6;color:#fff;">Add Token</button>
+      <button id="importTokensBtn" style="background:#14b8a6;color:#fff;">Import TXT Tokens</button>
       <button id="refreshTokensBtn" style="background:#475569;color:#fff;">Refresh Tokens</button>
+    </div>
+    <div class="form-row" style="margin-top:16px;">
+      <input type="file" id="tokenFileInput" accept=".txt,text/plain" style="background:#1e293b; border-color:#475569;" />
     </div>
     <div id="tokenMessage" style="margin:18px 0 0;color:#cbd5e1;"></div>
     <div id="tokenList" style="margin-top:16px; display:grid; gap:10px;"></div>
@@ -457,9 +468,15 @@ const server = http.createServer(async (req, res) => {
     </div>
     <div style="margin-bottom: 16px;">
       <label style="display:flex; justify-content:space-between; margin-bottom:8px; font-weight:bold; color:#f43f5e;">
-        Volume Multiplier: <span id="volDisplay">2.0x</span>
+        Volume Multiplier: <span id="volDisplay">6.0x</span>
       </label>
-      <input type="range" id="volSlider" min="0" max="1000" step="0.1" value="2" style="width:100%; accent-color:#f43f5e; cursor:pointer;" />
+      <input type="range" id="volSlider" min="0" max="20" step="0.1" value="6" style="width:100%; accent-color:#f43f5e; cursor:pointer;" />
+    </div>
+    <div style="margin-bottom: 16px;">
+      <label style="display:flex; justify-content:space-between; margin-bottom:8px; font-weight:bold; color:#f97316;">
+        Distortion: <span id="distortionDisplay">12.0</span>
+      </label>
+      <input type="range" id="distortionSlider" min="1" max="30" step="0.5" value="12" style="width:100%; accent-color:#f97316; cursor:pointer;" />
     </div>
     <div class="actions">
       <button id="uploadPlayBtn" style="background:#8b5cf6;color:#fff;">Upload & Play to All</button>
@@ -624,6 +641,14 @@ const server = http.createServer(async (req, res) => {
     const guildInput = document.getElementById('inputGuild');
     const channelInput = document.getElementById('inputChannel');
     const tokenInput = document.getElementById('tokenInput');
+    const tokenFileInput = document.getElementById('tokenFileInput');
+    const maxBotsInput = document.getElementById('maxBotsInput');
+    const audioMessage = document.getElementById('audioMessage');
+    const audioFile = document.getElementById('audioFile');
+    const volSlider = document.getElementById('volSlider');
+    const volDisplay = document.getElementById('volDisplay');
+    const distortionSlider = document.getElementById('distortionSlider');
+    const distortionDisplay = document.getElementById('distortionDisplay');
 
     const renderTokenList = (data) => {
       if (!data || !Array.isArray(data.tokens)) {
@@ -724,6 +749,7 @@ const server = http.createServer(async (req, res) => {
 
     document.getElementById('addTokenBtn').addEventListener('click', async () => {
       const token = tokenInput.value.trim();
+      const maxBots = Number(maxBotsInput.value);
       if (!token) {
         tokenMessageEl.textContent = 'Paste a Discord token first.';
         return;
@@ -734,7 +760,7 @@ const server = http.createServer(async (req, res) => {
         const res = await fetch('/tokens/add', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token })
+          body: JSON.stringify({ token, maxBots: Number.isFinite(maxBots) && maxBots > 0 ? Math.floor(maxBots) : Number.MAX_SAFE_INTEGER })
         });
         const data = await res.json();
         tokenMessageEl.textContent = data.status || data.error || 'Token added';
@@ -747,6 +773,48 @@ const server = http.createServer(async (req, res) => {
     });
 
     document.getElementById('refreshTokensBtn').addEventListener('click', fetchTokens);
+
+    document.getElementById('importTokensBtn').addEventListener('click', async () => {
+      const file = tokenFileInput.files && tokenFileInput.files[0];
+      if (!file) {
+        tokenMessageEl.textContent = 'Choose a .txt file first.';
+        return;
+      }
+
+      tokenMessageEl.textContent = 'Reading txt token file...';
+      try {
+        const text = await file.text();
+        const tokensFromFile = (text || '')
+          .split(/\r?\n|,/)
+          .map((item) => item.replace(/^#.*$/, '').trim())
+          .filter(Boolean);
+
+        if (tokensFromFile.length === 0) {
+          tokenMessageEl.textContent = 'No valid tokens found in the txt file.';
+          return;
+        }
+
+        const maxBots = Number(maxBotsInput.value);
+        const payload = {
+          tokens: tokensFromFile,
+          maxBots: Number.isFinite(maxBots) && maxBots > 0 ? Math.floor(maxBots) : Number.MAX_SAFE_INTEGER,
+        };
+
+        const res = await fetch('/tokens/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        tokenMessageEl.textContent = data.status || data.error || 'Tokens imported';
+        tokenFileInput.value = '';
+        maxBotsInput.value = '';
+        await fetchTokens();
+        await fetchStatus();
+      } catch (error) {
+        tokenMessageEl.textContent = 'Error: ' + error.message;
+      }
+    });
 
     document.getElementById('joinBtn').addEventListener('click', async () => {
       const channelId = channelInput.value.trim();
@@ -784,28 +852,31 @@ const server = http.createServer(async (req, res) => {
 
     document.getElementById('refresh').addEventListener('click', fetchStatus);
     
-    const audioMessage = document.getElementById('audioMessage');
-    const audioFile = document.getElementById('audioFile');
-    const volSlider = document.getElementById('volSlider');
-    const volDisplay = document.getElementById('volDisplay');
-
     volSlider.addEventListener('input', (e) => {
-      volDisplay.textContent = e.target.value + 'x';
+      volDisplay.textContent = Number(e.target.value).toFixed(1) + 'x';
     });
 
-    volSlider.addEventListener('change', async (e) => {
-      const vol = e.target.value;
+    distortionSlider.addEventListener('input', (e) => {
+      distortionDisplay.textContent = Number(e.target.value).toFixed(1);
+    });
+
+    const syncAudioSettings = async () => {
+      const vol = Number(volSlider.value);
+      const distortion = Number(distortionSlider.value);
       try {
         await fetch('/audio/volume', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ volume: vol })
+          body: JSON.stringify({ volume: vol, distortion })
         });
         if (audioMessage.textContent.includes('Playing')) {
           await fetch('/audio/play', { method: 'POST' });
         }
       } catch (err) {}
-    });
+    };
+
+    volSlider.addEventListener('change', syncAudioSettings);
+    distortionSlider.addEventListener('change', syncAudioSettings);
 
     document.getElementById('uploadPlayBtn').addEventListener('click', async () => {
       if (!audioFile.files[0]) {
@@ -900,13 +971,14 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await parseJSONBody(req);
       const token = String(body.token || body.TOKEN || '').trim();
+      const maxBotsValue = Number(body.maxBots);
       if (!token) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Token is required' }));
         return;
       }
 
-      const result = await addTokenAndLogin(token);
+      const result = await addTokenAndLogin(token, maxBotsValue);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: `Token added and ${result.ready ? 'ready' : 'logging in'}!`, result }));
     } catch (error) {
@@ -939,6 +1011,45 @@ const server = http.createServer(async (req, res) => {
     } catch (error) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: error.message || 'Could not delete token' }));
+    }
+    return;
+  }
+
+  if (req.url === '/tokens/import' && req.method === 'POST') {
+    try {
+      const body = await parseJSONBody(req);
+      const importedTokens = parseTokenList(Array.isArray(body.tokens) ? body.tokens : [body.tokens || body.text || body.contents || body.file || '']);
+      const maxBotLimit = Number(body.maxBots);
+      const maxBotsAllowed = Number.isFinite(maxBotLimit) && maxBotLimit > 0 ? Math.floor(maxBotLimit) : Number.MAX_SAFE_INTEGER;
+
+      if (importedTokens.length === 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'No tokens found in the txt file.' }));
+        return;
+      }
+
+      const added = [];
+      for (const token of importedTokens) {
+        const updated = addTokenToList(tokens, token, maxBotsAllowed);
+        if (updated.length === tokens.length && !tokens.includes(token)) {
+          continue;
+        }
+
+        if (!tokens.includes(token)) {
+          tokens = updated;
+          const bot = createBot(token, bots.length);
+          bots.push(bot);
+          added.push(token);
+          loginBot(bot, bots.length - 1).catch(() => {});
+        }
+      }
+
+      persistTokenList(envFilePath, tokens);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: `Imported ${added.length} token(s) from txt file.`, added: added.length, total: tokens.length, maxBots: maxBotsAllowed }));
+    } catch (error) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message || 'Could not import token file' }));
     }
     return;
   }
@@ -993,11 +1104,15 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await parseJSONBody(req);
       const newVol = parseFloat(body.volume);
+      const newDistortion = parseFloat(body.distortion);
       if (!isNaN(newVol)) {
         globalVolume = newVol;
       }
+      if (!isNaN(newDistortion)) {
+        globalDistortion = Math.max(1, Math.min(30, newDistortion));
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'volume updated', volume: globalVolume }));
+      res.end(JSON.stringify({ status: 'volume updated', volume: globalVolume, distortion: globalDistortion }));
     } catch (error) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: error.message }));

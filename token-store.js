@@ -2,19 +2,22 @@ const fs = require('fs');
 const path = require('path');
 
 function parseTokenList(value) {
-  if (Array.isArray(value)) {
-    return value
-      .flatMap((item) => String(item || '').split(/\r?\n|,/))
-      .map((item) => item.trim())
-      .filter(Boolean)
-      .filter((item, index, array) => array.indexOf(item) === index);
-  }
+  const rawValues = Array.isArray(value) ? value : [value];
 
-  return String(value || '')
-    .split(/\r?\n|,/) 
-    .map((item) => item.trim())
+  return rawValues
+    .flatMap((entry) => String(entry ?? '').split(/\r?\n|,/))
+    .map((item) => item.replace(/^#.*$/, '').trim())
     .filter(Boolean)
     .filter((item, index, array) => array.indexOf(item) === index);
+}
+
+function readTokenFile(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return [];
+  }
+
+  const content = fs.readFileSync(filePath, 'utf8');
+  return parseTokenList(content);
 }
 
 function addTokenToList(existingTokens, newToken, maxBots = Number.MAX_SAFE_INTEGER) {
@@ -81,6 +84,7 @@ function persistTokenList(filePath, tokens) {
 
 module.exports = {
   parseTokenList,
+  readTokenFile,
   addTokenToList,
   persistTokenList,
 };
