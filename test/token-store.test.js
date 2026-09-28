@@ -40,3 +40,8 @@ test('readTokenFile imports tokens from a .txt file', () => {
 
   fs.unlinkSync(filePath);
 });
+
+test('parseTokenList accepts BOT_TOKENS lines from old env txt files', () => {
+  const tokens = parseTokenList('BOT_TOKENS=token-a, token-b\n# old\n token-c\n token-d');
+  assert.deepEqual(tokens, ['token-a', 'token-b', 'token-c', 'token-d']);
+});

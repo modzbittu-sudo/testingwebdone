@@ -117,8 +117,22 @@ async function parseRequestBody(req) {
   });
 }
 
+function loadStartupTokens() {
+  const candidates = [
+    process.env.BOT_TOKENS || '',
+    process.env.BOT_TOKEN || '',
+    fs.existsSync(path.join(process.cwd(), '.env')) ? fs.readFileSync(path.join(process.cwd(), '.env'), 'utf8') : '',
+    fs.existsSync(path.join(process.cwd(), 'tokens.txt')) ? fs.readFileSync(path.join(process.cwd(), 'tokens.txt'), 'utf8') : '',
+    fs.existsSync(path.join(process.cwd(), 'BOT_TOKENS.txt')) ? fs.readFileSync(path.join(process.cwd(), 'BOT_TOKENS.txt'), 'utf8') : '',
+    fs.existsSync(path.join(process.cwd(), 'bot_tokens.txt')) ? fs.readFileSync(path.join(process.cwd(), 'bot_tokens.txt'), 'utf8') : '',
+  ];
+
+  const all = candidates.flatMap((entry) => Array.isArray(entry) ? entry : [entry]);
+  return parseTokenList(all);
+}
+
 const rawTokens = process.env.BOT_TOKENS || process.env.BOT_TOKEN || '';
-let tokens = parseTokenList(rawTokens);
+let tokens = loadStartupTokens();
 const autoJoin = (process.env.AUTO_JOIN || 'false').toLowerCase() === 'true';
 const rawChannels = process.env.VOICE_CHANNEL_IDS || process.env.VOICE_CHANNEL_ID || process.env.CHANNEL_ID || '';
 const channelIds = parseList(rawChannels);
@@ -510,7 +524,6 @@ const server = http.createServer(async (req, res) => {
     <h2 style="margin-top:0;">Token Manager</h2>
     <div class="form-row">
       <input id="tokenInput" placeholder="Paste Discord bot token" />
-      <input id="maxBotsInput" type="number" min="1" placeholder="Max bots (blank = all tokens)" />
     </div>
     <div class="actions">
       <button id="addTokenBtn" style="background:#8b5cf6;color:#fff;">Add Token</button>
@@ -727,7 +740,6 @@ const server = http.createServer(async (req, res) => {
     const channelInput = document.getElementById('inputChannel');
     const tokenInput = document.getElementById('tokenInput');
     const tokenFileInput = document.getElementById('tokenFileInput');
-    const maxBotsInput = document.getElementById('maxBotsInput');
     const audioMessage = document.getElementById('audioMessage');
     const audioFile = document.getElementById('audioFile');
     const volSlider = document.getElementById('volSlider');
@@ -841,7 +853,6 @@ const server = http.createServer(async (req, res) => {
 
     document.getElementById('addTokenBtn').addEventListener('click', async () => {
       const token = tokenInput.value.trim();
-      const maxBots = Number(maxBotsInput.value);
       if (!token) {
         tokenMessageEl.textContent = 'Paste a Discord token first.';
         return;
@@ -852,7 +863,7 @@ const server = http.createServer(async (req, res) => {
         const res = await fetch('/tokens/add', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token, maxBots: Number.isFinite(maxBots) && maxBots > 0 ? Math.floor(maxBots) : Number.MAX_SAFE_INTEGER })
+          body: JSON.stringify({ token })
         });
         const data = await res.json();
         tokenMessageEl.textContent = data.status || data.error || 'Token added';
@@ -886,10 +897,8 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        const maxBots = Number(maxBotsInput.value);
         const payload = {
-          tokens: tokensFromFile.join('\n'),
-          maxBots: Number.isFinite(maxBots) && maxBots > 0 ? Math.floor(maxBots) : Number.MAX_SAFE_INTEGER,
+          tokens: tokensFromFile.join('\n')
         };
 
         const res = await fetch('/tokens/import', {
@@ -900,7 +909,6 @@ const server = http.createServer(async (req, res) => {
         const data = await res.json();
         tokenMessageEl.textContent = data.status || data.error || 'Tokens imported';
         tokenFileInput.value = '';
-        maxBotsInput.value = '';
         await fetchTokens();
         await fetchStatus();
       } catch (error) {
