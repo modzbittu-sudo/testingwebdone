@@ -1,20 +1,54 @@
 const fs = require('fs');
 const path = require('path');
 
-function parseTokenList(value) {
-  if (Array.isArray(value)) {
-    return value
-      .flatMap((item) => String(item || '').split(/\r?\n|,/))
-      .map((item) => item.trim())
-      .filter(Boolean)
-      .filter((item, index, array) => array.indexOf(item) === index);
+function normalizeTokenCandidate(rawItem) {
+  let item = String(rawItem ?? '').replace(/\r/g, '').trim();
+  if (!item || item.startsWith('#') || item.startsWith('//')) {
+    return '';
   }
 
-  return String(value || '')
-    .split(/\r?\n|,/) 
-    .map((item) => item.trim())
+  item = item.replace(/^#.*$/, '').trim();
+  if (!item) {
+    return '';
+  }
+
+  const stripped = item
+    .replace(/^BOT_TOKENS?\s*[:=]\s*/i, '')
+    .replace(/^TOKEN\s*[:=]\s*/i, '')
+    .replace(/^DISCORD_TOKEN\s*[:=]\s*/i, '')
+    .replace(/^\s*['\"]|['\"]\s*$/g, '')
+    .replace(/^[\[\(]+|[\]\)]+$/g, '')
+    .split(/\s+/)[0]
+    .trim();
+
+  if (!stripped || /^(?:comment|old|example|token)$/i.test(stripped)) {
+    return '';
+  }
+
+  if (!/^[A-Za-z0-9._-]+$/.test(stripped)) {
+    return '';
+  }
+
+  return stripped;
+}
+
+function parseTokenList(value) {
+  const rawValues = Array.isArray(value) ? value : [value];
+
+  return rawValues
+    .flatMap((entry) => String(entry ?? '').split(/\r?\n|,|;/))
+    .map((item) => normalizeTokenCandidate(item))
     .filter(Boolean)
     .filter((item, index, array) => array.indexOf(item) === index);
+}
+
+function readTokenFile(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return [];
+  }
+
+  const content = fs.readFileSync(filePath, 'utf8');
+  return parseTokenList(content);
 }
 
 function addTokenToList(existingTokens, newToken, maxBots = Number.MAX_SAFE_INTEGER) {
@@ -81,6 +115,7 @@ function persistTokenList(filePath, tokens) {
 
 module.exports = {
   parseTokenList,
+  readTokenFile,
   addTokenToList,
   persistTokenList,
 };

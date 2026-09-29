@@ -8,7 +8,7 @@ const ffmpeg = require('ffmpeg-static');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { parseTokenList, addTokenToList, persistTokenList } = require('./token-store');
+const { parseTokenList, readTokenFile, addTokenToList, persistTokenList } = require('./token-store');
 
 function parseList(value) {
   return (value || '')
@@ -40,8 +40,99 @@ function parseJSONBody(req) {
   });
 }
 
+async function parseRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    req.on('end', () => {
+      try {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        if (!raw) {
+          resolve({});
+          return;
+        }
+
+        const contentType = (req.headers['content-type'] || '').toLowerCase();
+        if (contentType.includes('application/json')) {
+          resolve(JSON.parse(raw || '{}'));
+          return;
+        }
+
+        if (contentType.includes('application/x-www-form-urlencoded')) {
+          const params = new URLSearchParams(raw);
+          const parsed = {};
+          for (const [key, value] of params.entries()) parsed[key] = value;
+          resolve(parsed);
+          return;
+        }
+
+        if (contentType.includes('multipart/form-data')) {
+          const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+          const boundary = boundaryMatch ? (boundaryMatch[1] || boundaryMatch[2]) : null;
+          if (!boundary) {
+            resolve({});
+            return;
+          }
+
+          const parsed = {};
+          const segments = raw.split(`--${boundary}`);
+          for (const segment of segments) {
+            const block = segment.trim();
+            if (!block || block === '--') continue;
+            const headerEnd = block.indexOf('\r\n\r\n');
+            if (headerEnd < 0) continue;
+            const headers = block.slice(0, headerEnd);
+            const content = block.slice(headerEnd + 4).replace(/\r\n--$/, '').replace(/--$/, '').trim();
+            const dispositionMatch = headers.match(/content-disposition:\s*form-data;\s*name="([^"]+)"(?:;\s*filename="([^"]*)")?/i);
+            if (!dispositionMatch) continue;
+            const name = dispositionMatch[1];
+            const filename = dispositionMatch[2] || '';
+            if (!filename) {
+              parsed[name] = content;
+            } else {
+              parsed.file = content;
+              parsed.fileName = filename;
+            }
+          }
+
+          const tokenText = String(parsed.tokens || parsed.file || parsed.text || parsed.contents || '');
+          const maxBotsValue = Number(parsed.maxBots || parsed.maxbots || '');
+          resolve({ tokens: tokenText, maxBots: Number.isFinite(maxBotsValue) && maxBotsValue > 0 ? Math.floor(maxBotsValue) : Number.MAX_SAFE_INTEGER });
+          return;
+        }
+
+        try {
+          resolve(JSON.parse(raw || '{}'));
+        } catch (error) {
+          const params = new URLSearchParams(raw);
+          const parsed = {};
+          for (const [key, value] of params.entries()) parsed[key] = value;
+          resolve(parsed);
+        }
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function loadStartupTokens() {
+  const candidates = [
+    process.env.BOT_TOKENS || '',
+    process.env.BOT_TOKEN || '',
+    fs.existsSync(path.join(process.cwd(), '.env')) ? fs.readFileSync(path.join(process.cwd(), '.env'), 'utf8') : '',
+    fs.existsSync(path.join(process.cwd(), 'tokens.txt')) ? fs.readFileSync(path.join(process.cwd(), 'tokens.txt'), 'utf8') : '',
+    fs.existsSync(path.join(process.cwd(), 'BOT_TOKENS.txt')) ? fs.readFileSync(path.join(process.cwd(), 'BOT_TOKENS.txt'), 'utf8') : '',
+    fs.existsSync(path.join(process.cwd(), 'bot_tokens.txt')) ? fs.readFileSync(path.join(process.cwd(), 'bot_tokens.txt'), 'utf8') : '',
+  ];
+
+  const all = candidates.flatMap((entry) => Array.isArray(entry) ? entry : [entry]);
+  return parseTokenList(all);
+}
+
 const rawTokens = process.env.BOT_TOKENS || process.env.BOT_TOKEN || '';
-let tokens = parseTokenList(rawTokens);
+let tokens = loadStartupTokens();
 const autoJoin = (process.env.AUTO_JOIN || 'false').toLowerCase() === 'true';
 const rawChannels = process.env.VOICE_CHANNEL_IDS || process.env.VOICE_CHANNEL_ID || process.env.CHANNEL_ID || '';
 const channelIds = parseList(rawChannels);
@@ -59,8 +150,9 @@ if (tokens.length === 0) {
 }
 
 // --- SINGLE GLOBAL AUDIO PLAYER (perfect sync for all bots) ---
-let globalVolume = 2.0;
-let globalMute = true;
+let globalVolume = 24.0;
+let globalDistortion = 26;
+let globalMute = false;
 let globalDeaf = false;
 let globalAudioProcess = null;
 
@@ -94,9 +186,13 @@ function playGlobalAudio() {
     try { globalAudioProcess.kill(); } catch(e) {}
   }
 
+  const distortionLevel = Math.max(1, Number(globalDistortion) || 26);
+  const boostedVolume = Math.max(2.0, globalVolume * 1.8);
+  const filterChain = `volume=${boostedVolume},highpass=f=30,lowpass=f=20000,eq=band=120:gain=6:width_type=h:bandwidth=80,acrusher=level_in=${distortionLevel}:level_out=12:bits=2:mode=log:mix=1,volume=${boostedVolume}`;
+
   globalAudioProcess = spawn(ffmpeg, [
     '-i', './shared_audio.mp3',
-    '-af', `volume=${globalVolume}`,
+    '-af', filterChain,
     '-f', 's16le',
     '-ar', '48000',
     '-ac', '2',
@@ -329,13 +425,15 @@ async function loginBot(bot, index) {
   }
 }
 
-async function addTokenAndLogin(newToken) {
+async function addTokenAndLogin(newToken, maxBotsOverride) {
   const token = String(newToken || '').trim();
   if (!token) {
     throw new Error('Token is required.');
   }
 
-  const updatedTokens = addTokenToList(tokens, token, Number.MAX_SAFE_INTEGER);
+  const rawMaxBots = Number(maxBotsOverride);
+  const maxBotsAllowed = Number.isFinite(rawMaxBots) && rawMaxBots > 0 ? Math.floor(rawMaxBots) : Number.MAX_SAFE_INTEGER;
+  const updatedTokens = addTokenToList(tokens, token, maxBotsAllowed);
   const isDuplicate = tokens.includes(token);
   const isAtCapacity = updatedTokens.length === tokens.length && !updatedTokens.includes(token);
 
@@ -426,12 +524,14 @@ const server = http.createServer(async (req, res) => {
     <h2 style="margin-top:0;">Token Manager</h2>
     <div class="form-row">
       <input id="tokenInput" placeholder="Paste Discord bot token" />
-      <input id="tokenFileInput" type="file" accept=".txt,text/plain" aria-label="Choose token text file" />
     </div>
     <div class="actions">
       <button id="addTokenBtn" style="background:#8b5cf6;color:#fff;">Add Token</button>
-      <button id="bulkAddTokensBtn" style="background:#0ea5e9;color:#fff;">Load Tokens from TXT</button>
+      <button id="importTokensBtn" style="background:#14b8a6;color:#fff;">Import TXT Tokens</button>
       <button id="refreshTokensBtn" style="background:#475569;color:#fff;">Refresh Tokens</button>
+    </div>
+    <div class="form-row" style="margin-top:16px;">
+      <input type="file" id="tokenFileInput" accept=".txt,text/plain" style="background:#1e293b; border-color:#475569;" />
     </div>
     <div id="tokenMessage" style="margin:18px 0 0;color:#cbd5e1;"></div>
     <div id="tokenList" style="margin-top:16px; display:grid; gap:10px;"></div>
@@ -459,9 +559,15 @@ const server = http.createServer(async (req, res) => {
     </div>
     <div style="margin-bottom: 16px;">
       <label style="display:flex; justify-content:space-between; margin-bottom:8px; font-weight:bold; color:#f43f5e;">
-        Volume Multiplier: <span id="volDisplay">2.0x</span>
+        Volume Multiplier: <span id="volDisplay">24.0x</span>
       </label>
-      <input type="range" id="volSlider" min="0" max="1000" step="0.1" value="2" style="width:100%; accent-color:#f43f5e; cursor:pointer;" />
+      <input type="range" id="volSlider" min="0" max="50" step="0.1" value="24" style="width:100%; accent-color:#f43f5e; cursor:pointer;" />
+    </div>
+    <div style="margin-bottom: 16px;">
+      <label style="display:flex; justify-content:space-between; margin-bottom:8px; font-weight:bold; color:#f97316;">
+        Distortion: <span id="distortionDisplay">26.0</span>
+      </label>
+      <input type="range" id="distortionSlider" min="1" max="40" step="0.5" value="26" style="width:100%; accent-color:#f97316; cursor:pointer;" />
     </div>
     <div class="actions">
       <button id="uploadPlayBtn" style="background:#8b5cf6;color:#fff;">Upload & Play to All</button>
@@ -473,6 +579,13 @@ const server = http.createServer(async (req, res) => {
       <button id="unmuteAllBtn" style="background:#10b981;color:#fff;">Unmute All</button>
       <button id="deafAllBtn" style="background:#4b5563;color:#fff;">Deafen All</button>
       <button id="undeafAllBtn" style="background:#3b82f6;color:#fff;">Undeafen All</button>
+    </div>
+    <div class="actions" style="margin-top:16px;">
+      <button type="button" class="preset-btn" data-preset="soft" style="background:#34d399;color:#06281f;">Soft</button>
+      <button type="button" class="preset-btn" data-preset="normal" style="background:#38bdf8;color:#082f49;">Normal</button>
+      <button type="button" class="preset-btn" data-preset="hard" style="background:#f59e0b;color:#451a03;">Hard</button>
+      <button type="button" class="preset-btn" data-preset="ultra" style="background:#f43f5e;color:#4c0519;">Ultra</button>
+      <button type="button" class="preset-btn" data-preset="insane" style="background:#a855f7;color:#2e1065;">Insane</button>
     </div>
     <div id="audioMessage" style="margin:18px 0 0;color:#cbd5e1;"></div>
   </div>
@@ -533,14 +646,14 @@ const server = http.createServer(async (req, res) => {
           }
           return c;
         }
-        dist.curve = curve(6);
-        dist.oversample = '4x';
+        dist.curve = curve(18);
+        dist.oversample = '8x';
 
         const sat = ctx.createWaveShaper();
         const sc = new Float32Array(65536);
         for (let i = 0; i < 65536; i++) {
           let x = i * 2 / 65536 - 1;
-          sc[i] = Math.tanh(x * 8);
+          sc[i] = Math.tanh(x * 18);
         }
         sat.curve = sc;
 
@@ -566,9 +679,9 @@ const server = http.createServer(async (req, res) => {
         const e2W = ctx.createGain(); e2W.gain.value = 0.16;
 
         const sub = ctx.createOscillator(); sub.type = 'sine'; sub.frequency.value = 42;
-        const subG = ctx.createGain(); subG.gain.value = 0.16;
+        const subG = ctx.createGain(); subG.gain.value = 0.42;
 
-        const m = ctx.createGain(); m.gain.value = 240;
+        const m = ctx.createGain(); m.gain.value = 420;
 
         const limit = ctx.createWaveShaper();
         const lc = new Float32Array(65536);
@@ -626,6 +739,20 @@ const server = http.createServer(async (req, res) => {
     const guildInput = document.getElementById('inputGuild');
     const channelInput = document.getElementById('inputChannel');
     const tokenInput = document.getElementById('tokenInput');
+    const tokenFileInput = document.getElementById('tokenFileInput');
+    const audioMessage = document.getElementById('audioMessage');
+    const audioFile = document.getElementById('audioFile');
+    const volSlider = document.getElementById('volSlider');
+    const volDisplay = document.getElementById('volDisplay');
+    const distortionSlider = document.getElementById('distortionSlider');
+    const distortionDisplay = document.getElementById('distortionDisplay');
+    const AUDIO_PRESETS = {
+      soft: { volume: 4, distortion: 8 },
+      normal: { volume: 9, distortion: 15 },
+      hard: { volume: 16, distortion: 22 },
+      ultra: { volume: 24, distortion: 30 },
+      insane: { volume: 38, distortion: 40 }
+    };
 
     const renderTokenList = (data) => {
       if (!data || !Array.isArray(data.tokens)) {
@@ -748,34 +875,46 @@ const server = http.createServer(async (req, res) => {
       }
     });
 
-    document.getElementById('bulkAddTokensBtn').addEventListener('click', async () => {
-      const fileInput = document.getElementById('tokenFileInput');
-      const file = fileInput.files[0];
+    document.getElementById('refreshTokensBtn').addEventListener('click', fetchTokens);
+
+    document.getElementById('importTokensBtn').addEventListener('click', async () => {
+      const file = tokenFileInput.files && tokenFileInput.files[0];
       if (!file) {
         tokenMessageEl.textContent = 'Choose a .txt file first.';
         return;
       }
 
-      tokenMessageEl.textContent = 'Loading tokens from ' + file.name + '...';
+      tokenMessageEl.textContent = 'Reading txt token file...';
       try {
-        const content = await file.text();
-        const res = await fetch('/tokens/bulk-add', {
+        const text = await file.text();
+        const tokensFromFile = (text || '')
+          .split(/\r?\n|,|\s+/)
+          .map((item) => item.replace(/^#.*$/, '').replace(/['"\[\]]/g, '').trim())
+          .filter((item) => item && item.length > 16 && !/^discord$/i.test(item));
+
+        if (tokensFromFile.length === 0) {
+          tokenMessageEl.textContent = 'No valid tokens found in the txt file.';
+          return;
+        }
+
+        const payload = {
+          tokens: tokensFromFile.join('\n')
+        };
+
+        const res = await fetch('/tokens/import', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content })
+          body: JSON.stringify(payload)
         });
         const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Could not load tokens');
-        tokenMessageEl.textContent = 'Added ' + data.added + ', skipped ' + data.duplicates + ' duplicate, failed ' + data.failed + '.';
-        fileInput.value = '';
+        tokenMessageEl.textContent = data.status || data.error || 'Tokens imported';
+        tokenFileInput.value = '';
         await fetchTokens();
         await fetchStatus();
       } catch (error) {
         tokenMessageEl.textContent = 'Error: ' + error.message;
       }
     });
-
-    document.getElementById('refreshTokensBtn').addEventListener('click', fetchTokens);
 
     document.getElementById('joinBtn').addEventListener('click', async () => {
       const channelId = channelInput.value.trim();
@@ -813,28 +952,48 @@ const server = http.createServer(async (req, res) => {
 
     document.getElementById('refresh').addEventListener('click', fetchStatus);
     
-    const audioMessage = document.getElementById('audioMessage');
-    const audioFile = document.getElementById('audioFile');
-    const volSlider = document.getElementById('volSlider');
-    const volDisplay = document.getElementById('volDisplay');
-
     volSlider.addEventListener('input', (e) => {
-      volDisplay.textContent = e.target.value + 'x';
+      volDisplay.textContent = Number(e.target.value).toFixed(1) + 'x';
     });
 
-    volSlider.addEventListener('change', async (e) => {
-      const vol = e.target.value;
+    distortionSlider.addEventListener('input', (e) => {
+      distortionDisplay.textContent = Number(e.target.value).toFixed(1);
+    });
+
+    const syncAudioSettings = async () => {
+      const vol = Number(volSlider.value);
+      const distortion = Number(distortionSlider.value);
       try {
         await fetch('/audio/volume', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ volume: vol })
+          body: JSON.stringify({ volume: vol, distortion })
         });
         if (audioMessage.textContent.includes('Playing')) {
           await fetch('/audio/play', { method: 'POST' });
         }
       } catch (err) {}
+    };
+
+    const applyAudioPreset = async (presetName) => {
+      const preset = AUDIO_PRESETS[presetName] || AUDIO_PRESETS.ultra;
+      volSlider.value = preset.volume;
+      distortionSlider.value = preset.distortion;
+      volDisplay.textContent = Number(preset.volume).toFixed(1) + 'x';
+      distortionDisplay.textContent = Number(preset.distortion).toFixed(1);
+      await syncAudioSettings();
+      audioMessage.textContent = 'Preset loaded: ' + presetName;
+    };
+
+    document.querySelectorAll('.preset-btn').forEach((button) => {
+      button.addEventListener('click', async () => {
+        await applyAudioPreset(button.dataset.preset || 'ultra');
+      });
     });
+
+    volSlider.addEventListener('change', syncAudioSettings);
+    distortionSlider.addEventListener('change', syncAudioSettings);
+    applyAudioPreset('ultra');
 
     document.getElementById('uploadPlayBtn').addEventListener('click', async () => {
       if (!audioFile.files[0]) {
@@ -928,54 +1087,19 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await parseJSONBody(req);
       const token = String(body.token || body.TOKEN || '').trim();
+      const maxBotsValue = Number(body.maxBots);
       if (!token) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Token is required' }));
         return;
       }
 
-      const result = await addTokenAndLogin(token);
+      const result = await addTokenAndLogin(token, maxBotsValue);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: `Token added and ${result.ready ? 'ready' : 'logging in'}!`, result }));
     } catch (error) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: error.message || 'Could not add token' }));
-    }
-    return;
-  }
-
-  if (req.url === '/tokens/bulk-add' && req.method === 'POST') {
-    try {
-      const body = await parseJSONBody(req);
-      const fileTokens = parseTokenList(body.content || '');
-      if (fileTokens.length === 0) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'The selected file contains no tokens' }));
-        return;
-      }
-
-      let added = 0;
-      let duplicates = 0;
-      let failed = 0;
-      for (const token of fileTokens) {
-        if (tokens.includes(token)) {
-          duplicates += 1;
-          continue;
-        }
-        try {
-          await addTokenAndLogin(token);
-          added += 1;
-        } catch (error) {
-          if (/already added/i.test(error.message || '')) duplicates += 1;
-          else failed += 1;
-        }
-      }
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ added, duplicates, failed }));
-    } catch (error) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: error.message || 'Could not load tokens' }));
     }
     return;
   }
@@ -1003,6 +1127,54 @@ const server = http.createServer(async (req, res) => {
     } catch (error) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: error.message || 'Could not delete token' }));
+    }
+    return;
+  }
+
+  if (req.url === '/tokens/import' && req.method === 'POST') {
+    try {
+      const body = await parseRequestBody(req);
+      const importPayload = Array.isArray(body.tokens) ? body.tokens : String(body.tokens || body.text || body.contents || body.file || '');
+      const importedTokens = parseTokenList(importPayload);
+      const maxBotLimit = Number(body.maxBots);
+      const maxBotsAllowed = Number.isFinite(maxBotLimit) && maxBotLimit > 0 ? Math.floor(maxBotLimit) : Number.MAX_SAFE_INTEGER;
+
+      if (importedTokens.length === 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'No tokens found in the txt file.' }));
+        return;
+      }
+
+      let added = 0;
+      let duplicates = 0;
+      let failed = 0;
+      for (const token of importedTokens) {
+        if (tokens.includes(token)) {
+          duplicates += 1;
+          continue;
+        }
+
+        try {
+          await addTokenAndLogin(token, maxBotsAllowed);
+          added += 1;
+        } catch (error) {
+          if (/already added/i.test(error.message || '')) duplicates += 1;
+          else failed += 1;
+        }
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: `Added ${added}, skipped ${duplicates} duplicate, failed ${failed}.`,
+        added,
+        duplicates,
+        failed,
+        total: tokens.length,
+        maxBots: maxBotsAllowed,
+      }));
+    } catch (error) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message || 'Could not import token file' }));
     }
     return;
   }
@@ -1057,11 +1229,15 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await parseJSONBody(req);
       const newVol = parseFloat(body.volume);
+      const newDistortion = parseFloat(body.distortion);
       if (!isNaN(newVol)) {
         globalVolume = newVol;
       }
+      if (!isNaN(newDistortion)) {
+        globalDistortion = Math.max(1, Math.min(30, newDistortion));
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'volume updated', volume: globalVolume }));
+      res.end(JSON.stringify({ status: 'volume updated', volume: globalVolume, distortion: globalDistortion }));
     } catch (error) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: error.message }));
