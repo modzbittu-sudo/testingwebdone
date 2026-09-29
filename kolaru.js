@@ -426,9 +426,11 @@ const server = http.createServer(async (req, res) => {
     <h2 style="margin-top:0;">Token Manager</h2>
     <div class="form-row">
       <input id="tokenInput" placeholder="Paste Discord bot token" />
+      <input id="tokenFileInput" type="file" accept=".txt,text/plain" aria-label="Choose token text file" />
     </div>
     <div class="actions">
       <button id="addTokenBtn" style="background:#8b5cf6;color:#fff;">Add Token</button>
+      <button id="bulkAddTokensBtn" style="background:#0ea5e9;color:#fff;">Load Tokens from TXT</button>
       <button id="refreshTokensBtn" style="background:#475569;color:#fff;">Refresh Tokens</button>
     </div>
     <div id="tokenMessage" style="margin:18px 0 0;color:#cbd5e1;"></div>
@@ -638,7 +640,7 @@ const server = http.createServer(async (req, res) => {
 
       tokenListEl.innerHTML = data.tokens.map((tokenItem, index) => {
         const item = tokenItem || {};
-        const token = item.token || '';
+        const token = item.masked || item.token || '';
         const status = item.status || 'waiting';
         const label = status === 'ready' ? 'Ready' : status === 'invalid' ? 'Invalid' : status === 'offline' ? 'Offline' : 'Waiting';
         const statusColor = status === 'ready' ? '#22c55e' : status === 'invalid' ? '#f97316' : status === 'offline' ? '#fbbf24' : '#38bdf8';
@@ -647,7 +649,7 @@ const server = http.createServer(async (req, res) => {
         return '<div style="padding:12px; border:1px solid rgba(148,163,184,.22); border-radius:12px; background:#0f172a; display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap;">'
           + '<div style="flex:1; min-width:220px;">'
           + '<div><strong>Token ' + (index + 1) + '</strong> <span style="color:' + statusColor + '; font-weight:700;">' + label + '</span></div>'
-          + '<div style="font-size:12px; color:#94a3b8; word-break:break-all; margin-top:4px;">' + (token ? token.slice(0, 8) + '...' + token.slice(-4) : 'token hidden') + '</div>'
+          + '<div style="font-size:12px; color:#94a3b8; word-break:break-all; margin-top:4px;">' + (token || 'token hidden') + '</div>'
           + errorText
           + '</div>'
           + '<button type="button" data-token-index="' + index + '" class="delete-token-btn" style="background:#ef4444;color:#fff;padding:8px 12px;border-radius:10px;border:none;cursor:pointer; font-weight:700;">Delete</button>'
@@ -739,6 +741,33 @@ const server = http.createServer(async (req, res) => {
         const data = await res.json();
         tokenMessageEl.textContent = data.status || data.error || 'Token added';
         tokenInput.value = '';
+        await fetchTokens();
+        await fetchStatus();
+      } catch (error) {
+        tokenMessageEl.textContent = 'Error: ' + error.message;
+      }
+    });
+
+    document.getElementById('bulkAddTokensBtn').addEventListener('click', async () => {
+      const fileInput = document.getElementById('tokenFileInput');
+      const file = fileInput.files[0];
+      if (!file) {
+        tokenMessageEl.textContent = 'Choose a .txt file first.';
+        return;
+      }
+
+      tokenMessageEl.textContent = 'Loading tokens from ' + file.name + '...';
+      try {
+        const content = await file.text();
+        const res = await fetch('/tokens/bulk-add', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not load tokens');
+        tokenMessageEl.textContent = 'Added ' + data.added + ', skipped ' + data.duplicates + ' duplicate, failed ' + data.failed + '.';
+        fileInput.value = '';
         await fetchTokens();
         await fetchStatus();
       } catch (error) {
@@ -883,7 +912,6 @@ const server = http.createServer(async (req, res) => {
       }
       return {
         index,
-        token,
         masked: token.slice(0, 8) + '...' + token.slice(-4),
         status,
         lastError,
@@ -912,6 +940,42 @@ const server = http.createServer(async (req, res) => {
     } catch (error) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: error.message || 'Could not add token' }));
+    }
+    return;
+  }
+
+  if (req.url === '/tokens/bulk-add' && req.method === 'POST') {
+    try {
+      const body = await parseJSONBody(req);
+      const fileTokens = parseTokenList(body.content || '');
+      if (fileTokens.length === 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'The selected file contains no tokens' }));
+        return;
+      }
+
+      let added = 0;
+      let duplicates = 0;
+      let failed = 0;
+      for (const token of fileTokens) {
+        if (tokens.includes(token)) {
+          duplicates += 1;
+          continue;
+        }
+        try {
+          await addTokenAndLogin(token);
+          added += 1;
+        } catch (error) {
+          if (/already added/i.test(error.message || '')) duplicates += 1;
+          else failed += 1;
+        }
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ added, duplicates, failed }));
+    } catch (error) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message || 'Could not load tokens' }));
     }
     return;
   }

@@ -19,3 +19,5 @@ Use these values in Render:
 ## Notes
 
 The app starts the bot monitor and health endpoint from [kolaru.js](kolaru.js).
+
+Use the Token Manager's `Load Tokens from TXT` control to import multiple tokens. Put one token per line (or separate tokens with commas); duplicates are skipped. Imported tokens are saved to the server's ignored `.env` file and are returned to the page only in masked form. Do not commit token files or share them.
